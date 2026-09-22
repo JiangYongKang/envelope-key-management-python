@@ -1,0 +1,9 @@
+{
+  "versions": [
+    {
+      "version": "v1",
+      "key_material": "REPLACE_WITH_BASE64URL_32_BYTE_KEY",
+      "state": "ACTIVE"
+    }
+  ]
+}
