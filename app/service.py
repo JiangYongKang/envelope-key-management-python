@@ -34,6 +34,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.CIPHERTEXT_TAMPERED: 409,
     ErrorCode.ROTATION_RACE: 409,
     ErrorCode.AUDIT_WRITE_FAILED: 500,
+    ErrorCode.STATE_PERSIST_FAILED: 500,
     ErrorCode.NO_ACTIVE_KEY: 503,
     ErrorCode.INVALID_LIFECYCLE_TRANSITION: 409,
 }
@@ -58,6 +59,17 @@ class RotateRequest(BaseModel):
 
 class VersionAction(BaseModel):
     version: str = Field(min_length=1)
+
+
+class MigrateRequest(BaseModel):
+    ciphertexts: list[str] = Field(
+        min_length=1, description="envelope tokens to re-encrypt onto the current version"
+    )
+    context: dict[str, str] | None = Field(
+        default=None,
+        description="optional guard: items whose bound context differs fail "
+                    "with CONTEXT_MISMATCH; omitted keeps each token's context",
+    )
 
 
 def create_app(
@@ -129,6 +141,18 @@ def create_app(
         manager = manager_provider()
         manager.revoke(body.version)
         return {"version": body.version, "state": "REVOKED"}
+
+    @app.post("/keys/migrate")
+    async def migrate(body: MigrateRequest):
+        """Re-encrypt a batch of tokens onto the current ACTIVE version.
+
+        Always 200 with a per-item report: every input token is classified
+        as MIGRATED / ALREADY_CURRENT / FAILED (with its error code), so a
+        partially failing batch is never reported as uniformly successful.
+        """
+        manager = manager_provider()
+        report = manager.migrate(body.ciphertexts, body.context)
+        return report.to_dict()
 
     @app.post("/encrypt")
     async def encrypt(body: EncryptRequest):

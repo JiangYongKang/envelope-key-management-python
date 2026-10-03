@@ -23,6 +23,7 @@ class ErrorCode(str, Enum):
     CIPHERTEXT_TAMPERED = "CIPHERTEXT_TAMPERED"
     ROTATION_RACE = "ROTATION_RACE"
     AUDIT_WRITE_FAILED = "AUDIT_WRITE_FAILED"
+    STATE_PERSIST_FAILED = "STATE_PERSIST_FAILED"
     NO_ACTIVE_KEY = "NO_ACTIVE_KEY"
     INVALID_LIFECYCLE_TRANSITION = "INVALID_LIFECYCLE_TRANSITION"
 
@@ -115,6 +116,17 @@ class RotationRaceError(KeyManagementError):
 class AuditWriteFailedError(KeyManagementError):
     def __init__(self, message: str) -> None:
         super().__init__(ErrorCode.AUDIT_WRITE_FAILED, message)
+
+
+class StatePersistFailedError(KeyManagementError):
+    """Raised when a lifecycle/migration outcome cannot be durably persisted.
+
+    The in-memory state is rolled back before this is raised, so the caller
+    never observes "success at runtime, lost after restart".
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(ErrorCode.STATE_PERSIST_FAILED, message)
 
 
 class NoActiveKeyError(KeyManagementError):

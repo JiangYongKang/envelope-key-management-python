@@ -79,9 +79,10 @@ def file_audit(tmp_path) -> AuditLogger:
 def manager_factory(null_audit):
     created: list[KeyManager] = []
 
-    def _factory(states=("ACTIVE",), key_id: str = "test-key", audit=None) -> KeyManager:
+    def _factory(states=("ACTIVE",), key_id: str = "test-key", audit=None,
+                 state_store=None) -> KeyManager:
         source = InlineKeySource(make_inline_versions(*states))
-        manager = KeyManager(key_id, source, audit or null_audit)
+        manager = KeyManager(key_id, source, audit or null_audit, state_store)
         created.append(manager)
         return manager
 

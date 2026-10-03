@@ -11,7 +11,7 @@ from app.errors import ConfigurationError
 from app.key_source import generate_local_key
 from app.models import b64e
 
-from .conftest import log_case
+from .conftest import log_case, make_inline_versions
 
 
 def _keys_file(path, *states):
@@ -97,3 +97,44 @@ def test_bootstrap_rejects_no_active_and_multiple_active(tmp_path):
     with pytest.raises(ConfigurationError):
         build_manager(load_settings({"EKM_KEY_FILE": str(two)}))
     log_case("config-active-constraints")
+
+
+def test_state_path_from_env_and_restart(tmp_path):
+    """EKM_STATE_PATH makes lifecycle outcomes survive a rebuild."""
+    from app.config import build_manager, load_settings
+
+    key_file = tmp_path / "keys.json"
+    key_file.write_text(json.dumps({"versions": make_inline_versions("ACTIVE")}))
+    state_file = tmp_path / "state.json"
+    env = {
+        "EKM_KEY_ID": "primary",
+        "EKM_KEY_FILE": str(key_file),
+        "EKM_STATE_PATH": str(state_file),
+    }
+    settings = load_settings(env)
+    assert settings.state_path == str(state_file)
+
+    m1 = build_manager(settings)
+    m1.rotate()
+    assert m1.current_version() == "v2"
+    assert state_file.exists()
+
+    m2 = build_manager(load_settings(env))  # simulated restart
+    assert m2.current_version() == "v2"
+    log_case("config-state-path-restart")
+
+
+def test_state_path_from_config_file(tmp_path):
+    from app.config import load_settings
+
+    key_file = tmp_path / "keys.json"
+    key_file.write_text(json.dumps({"versions": make_inline_versions("ACTIVE")}))
+    config_file = tmp_path / "config.json"
+    config_file.write_text(json.dumps({
+        "key_id": "primary",
+        "key_source": {"type": "file", "path": str(key_file)},
+        "state_path": str(tmp_path / "state.json"),
+    }))
+    settings = load_settings({"EKM_CONFIG_FILE": str(config_file)})
+    assert settings.state_path == str(tmp_path / "state.json")
+    log_case("config-state-path-file")

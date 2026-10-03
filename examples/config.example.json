@@ -4,5 +4,6 @@
     "type": "file",
     "path": "./local-keys.json"
   },
-  "audit_path": "./audit.jsonl"
+  "audit_path": "./audit.jsonl",
+  "state_path": "./ekm-state.json"
 }

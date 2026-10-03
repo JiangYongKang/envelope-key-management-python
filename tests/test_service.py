@@ -72,3 +72,27 @@ def test_http_response_never_leaks_material(client):
     body = json.dumps(r.json())
     assert "TOPSECRET" not in body
     log_case("http-no-leak")
+
+
+def test_http_migrate_endpoint(client):
+    tok = client.post("/encrypt", json={"plaintext": "m", "context": {"t": "a"}}).json()["ciphertext"]
+    client.post("/keys/rotate", json={})
+    r = client.post("/keys/migrate", json={"ciphertexts": [tok, "garbage"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 2 and body["migrated"] == 1 and body["failed"] == 1
+    assert body["items"][0]["status"] == "MIGRATED"
+    assert body["items"][1]["error_code"] == "CIPHERTEXT_INVALID"
+    new_tok = body["items"][0]["ciphertext"]
+    r2 = client.post("/decrypt", json={"ciphertext": new_tok, "context": {"t": "a"}})
+    assert r2.status_code == 200 and r2.json()["plaintext"] == "m"
+    log_case("http-migrate", migrated=body["migrated"], failed=body["failed"])
+
+
+def test_http_migrate_response_never_leaks_plaintext(client):
+    client.post("/encrypt", json={"plaintext": "TOPSECRET", "context": {}})
+    tok = client.post("/encrypt", json={"plaintext": "TOPSECRET", "context": {}}).json()["ciphertext"]
+    client.post("/keys/rotate", json={})
+    body = json.dumps(client.post("/keys/migrate", json={"ciphertexts": [tok]}).json())
+    assert "TOPSECRET" not in body
+    log_case("http-migrate-no-leak")

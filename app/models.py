@@ -33,6 +33,7 @@ class KeyOperation(str, Enum):
     ROTATE = "ROTATE"
     DEACTIVATE = "DEACTIVATE"
     REVOKE = "REVOKE"
+    MIGRATE = "MIGRATE"
 
 
 class OperationResult(str, Enum):
@@ -201,6 +202,72 @@ class EnvelopeCiphertext:
             tag=tag,
             context=context,
         )
+
+
+class MigrationStatus(str, Enum):
+    """Per-item outcome of a ciphertext migration batch."""
+
+    MIGRATED = "MIGRATED"                # re-encrypted under the target version
+    ALREADY_CURRENT = "ALREADY_CURRENT"  # already on the target; returned as-is
+    FAILED = "FAILED"                    # classified failure, see error_code
+
+
+@dataclass(frozen=True)
+class MigrationItemResult:
+    """One item of a migration batch; exactly one entry per input token."""
+
+    index: int
+    status: MigrationStatus
+    key_version: str | None        # version embedded in the input token
+    target_version: str | None     # current ACTIVE version when processed
+    ciphertext: str | None         # new token (MIGRATED) / original (ALREADY_CURRENT)
+    error_code: str | None
+    detail: str
+    input_digest: str              # sha256 of the input token (never plaintext)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "status": self.status.value,
+            "key_version": self.key_version,
+            "target_version": self.target_version,
+            "ciphertext": self.ciphertext,
+            "error_code": self.error_code,
+            "detail": self.detail,
+            "input_digest": self.input_digest,
+        }
+
+
+@dataclass(frozen=True)
+class MigrationReport:
+    """Aggregate of a migration batch; counts always match the item list."""
+
+    items: tuple[MigrationItemResult, ...]
+
+    @property
+    def total(self) -> int:
+        return len(self.items)
+
+    @property
+    def migrated(self) -> int:
+        return sum(1 for i in self.items if i.status is MigrationStatus.MIGRATED)
+
+    @property
+    def already_current(self) -> int:
+        return sum(1 for i in self.items if i.status is MigrationStatus.ALREADY_CURRENT)
+
+    @property
+    def failed(self) -> int:
+        return sum(1 for i in self.items if i.status is MigrationStatus.FAILED)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "total": self.total,
+            "migrated": self.migrated,
+            "already_current": self.already_current,
+            "failed": self.failed,
+            "items": [i.to_dict() for i in self.items],
+        }
 
 
 @dataclass(frozen=True)

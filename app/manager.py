@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from .audit import AuditLogger, NullAuditLogger
 from .crypto import decrypt_envelope, encrypt_envelope
 from .errors import (
+    AuditWriteFailedError,
     CiphertextInvalidError,
     CiphertextTamperedError,
     ConfigurationError,
@@ -31,6 +32,7 @@ from .errors import (
     InvalidLifecycleTransitionError,
     KeyDeactivatedError,
     KeyIdMismatchError,
+    KeyManagementError,
     KeyRevokedError,
     KeyVersionNotFoundError,
     NoActiveKeyError,
@@ -42,9 +44,18 @@ from .models import (
     KeyOperation,
     KeyState,
     KeyVersion,
+    MigrationItemResult,
+    MigrationReport,
+    MigrationStatus,
     OperationResult,
     AuditRecord,
     digest_hex,
+)
+from .state_store import (
+    InMemoryStateStore,
+    KeyStateStore,
+    RingSnapshot,
+    VersionSnapshot,
 )
 
 logger = logging.getLogger("ekm")
@@ -70,12 +81,14 @@ class KeyManager:
         key_id: str,
         key_source: LocalKeySource,
         audit_logger: AuditLogger | NullAuditLogger,
+        state_store: KeyStateStore | None = None,
     ) -> None:
         if not isinstance(key_id, str) or not key_id:
             raise ConfigurationError("key id must be a non-empty string")
         self._key_id = key_id
         self._key_source = key_source
         self._audit = audit_logger
+        self._store = state_store if state_store is not None else InMemoryStateStore()
         self._lock = threading.RLock()
         self._ring: dict[str, KeyVersion] = {}
         self._current_version: str | None = None
@@ -86,7 +99,38 @@ class KeyManager:
     # Bootstrap
     # ------------------------------------------------------------------ #
     def _bootstrap(self) -> None:
-        """Load local keys from the source; reject incomplete config."""
+        """Load the ring: persisted snapshot wins over the key source.
+
+        A snapshot in the state store reflects every lifecycle outcome since
+        first boot, so it is authoritative; the key source is only consulted
+        on the very first boot (no snapshot yet), and the resulting ring is
+        immediately persisted so later restarts never fall back to stale
+        source configuration.
+        """
+        snapshot = self._store.load()
+        if snapshot is not None:
+            if snapshot.key_id != self._key_id:
+                raise ConfigurationError(
+                    f"state store snapshot belongs to key id '{snapshot.key_id}' "
+                    f"but this service is configured for '{self._key_id}'"
+                )
+            self._ring = {
+                v.version: KeyVersion(
+                    version=v.version,
+                    key_material=v.key_material,
+                    state=v.state,
+                    created_at=v.created_at,
+                )
+                for v in snapshot.versions
+            }
+            self._current_version = snapshot.current_version
+            self._sequence = self._initial_sequence([v.version for v in snapshot.versions])
+            logger.info(
+                "key manager restored from state store key_id=%s current=%s versions=%d",
+                self._key_id, self._current_version, len(self._ring),
+            )
+            return
+
         sourced = self._key_source.load()  # raises ConfigurationError on bad config
 
         ring: dict[str, KeyVersion] = {}
@@ -117,6 +161,10 @@ class KeyManager:
         # Sequence starts above any trailing integer suffix so generated
         # labels never collide with configured ones (v1, v2, 3, ...).
         self._sequence = self._initial_sequence([s.version for s in sourced])
+        # Persist the initial ring so first-boot state is also restart-safe;
+        # if this fails the service refuses to start rather than run with
+        # outcomes that would silently vanish on restart.
+        self._persist()
         logger.info(
             "key manager bootstrapped key_id=%s current=%s versions=%d",
             self._key_id, self._current_version, len(self._ring),
@@ -129,6 +177,37 @@ class KeyManager:
             if label.startswith("v") and label[1:].isdigit():
                 highest = max(highest, int(label[1:]))
         return highest
+
+    # ------------------------------------------------------------------ #
+    # Persistence helpers
+    # ------------------------------------------------------------------ #
+    def _snapshot(self) -> RingSnapshot:
+        """Capture the current ring (caller must hold the lock)."""
+        assert self._current_version is not None
+        return RingSnapshot(
+            key_id=self._key_id,
+            current_version=self._current_version,
+            versions=tuple(
+                VersionSnapshot(
+                    version=kv.version,
+                    key_material=kv.key_material,
+                    state=kv.state,
+                    created_at=kv.created_at,
+                )
+                for kv in self._ring.values()
+            ),
+        )
+
+    def _persist(self) -> None:
+        """Durably store the current ring or raise StatePersistFailedError."""
+        self._store.save(self._snapshot())
+
+    def _persist_best_effort(self) -> None:
+        """Rollback helper: try to restore the persisted state, log on failure."""
+        try:
+            self._persist()
+        except Exception as exc:  # noqa: BLE001 - rollback is best effort
+            logger.error("failed to re-persist rolled-back key-ring state: %s", exc)
 
     # ------------------------------------------------------------------ #
     # Lifecycle transitions
@@ -179,6 +258,18 @@ class KeyManager:
             self._current_version = new_label
 
             try:
+                # The transition only counts once it is durably persisted;
+                # a store failure rolls the whole rotation back.
+                self._persist()
+            except Exception:
+                self._current_version = old_version
+                if old_kv is not None:
+                    self._ring[old_version] = old_kv
+                del self._ring[new_label]
+                self._sequence -= 1
+                raise
+
+            try:
                 self._audit.append(
                     self._make_record(
                         KeyOperation.ROTATE, OperationResult.SUCCESS,
@@ -194,6 +285,7 @@ class KeyManager:
                     self._ring[old_version] = old_kv
                 del self._ring[new_label]
                 self._sequence -= 1
+                self._persist_best_effort()  # keep disk == rolled-back memory
                 raise
             logger.info("rotation %s -> %s key_id=%s", old_version, new_label, self._key_id)
             return new_label
@@ -274,6 +366,11 @@ class KeyManager:
             )
             self._ring[version] = new_kv
             try:
+                self._persist()
+            except Exception:
+                self._ring[version] = kv  # rollback, then surface persist failure
+                raise
+            try:
                 self._audit.append(
                     self._make_record(
                         operation, OperationResult.SUCCESS, version, None,
@@ -283,6 +380,7 @@ class KeyManager:
                 )
             except Exception:
                 self._ring[version] = kv  # rollback, then surface audit failure
+                self._persist_best_effort()  # keep disk == rolled-back memory
                 raise
             logger.info("key %s %s -> %s", version, kv.state.value, target.value)
 
@@ -440,6 +538,223 @@ class KeyManager:
         )
         self._decision_log("DECRYPT", "success", version, None, ctx.digest(), token_digest)
         return plaintext
+
+    # ------------------------------------------------------------------ #
+    # Migration (re-encrypt historical ciphertexts onto the current key)
+    # ------------------------------------------------------------------ #
+    def migrate(
+        self,
+        tokens: list[str],
+        context: dict[str, str] | EncryptionContext | None = None,
+    ) -> MigrationReport:
+        """Re-encrypt a batch of tokens onto the current ACTIVE version.
+
+        The caller supplies ciphertexts only — never plaintext. The plaintext
+        exists only transiently in memory inside this method; results carry
+        new tokens and digests, never plaintext.
+
+        * ``context=None``: each token's bound context is reused as-is, so
+          migrated tokens keep decrypting with their original context.
+        * ``context={...}``: an additional guard — tokens whose bound context
+          differs fail that item with CONTEXT_MISMATCH.
+
+        Every input token produces exactly one item in the report, classified
+        as MIGRATED / ALREADY_CURRENT / FAILED (with a stable error code).
+        Each item is processed atomically with respect to lifecycle
+        transitions: if the target version is deactivated/revoked mid-batch,
+        the affected items fail explicitly instead of producing ciphertext
+        that no key can decrypt. Re-migrating an already-migrated token is a
+        no-op (ALREADY_CURRENT, original token returned), so re-running the
+        same batch is idempotent.
+        """
+        if isinstance(context, (dict, EncryptionContext)):
+            expected_ctx: EncryptionContext | None = self._coerce_context(context)
+        elif context is None:
+            expected_ctx = None
+        else:
+            raise TypeError("context must be a dict[str, str], EncryptionContext or None")
+        if not isinstance(tokens, (list, tuple)):
+            raise TypeError("tokens must be a list of envelope tokens")
+
+        items = [
+            self._migrate_one(index, token, expected_ctx)
+            for index, token in enumerate(tokens)
+        ]
+        report = MigrationReport(items=tuple(items))
+        logger.info(
+            "migration batch key_id=%s total=%d migrated=%d already_current=%d failed=%d",
+            self._key_id, report.total, report.migrated,
+            report.already_current, report.failed,
+        )
+        return report
+
+    def _migrate_one(
+        self,
+        index: int,
+        token: object,
+        expected_ctx: EncryptionContext | None,
+    ) -> MigrationItemResult:
+        token_digest = digest_hex(token.encode("utf-8")) if isinstance(token, str) \
+            else digest_hex(repr(token).encode("utf-8"))
+
+        def failed(err: KeyManagementError, version: str | None, detail: str,
+                   target: str | None = None) -> MigrationItemResult:
+            self._decision_log("MIGRATE", "failure", version, err.code.value,
+                               expected_ctx.digest() if expected_ctx else None,
+                               token_digest)
+            self._failure_record(
+                KeyOperation.MIGRATE, version, err, detail=detail,
+                context_digest=expected_ctx.digest() if expected_ctx else None,
+                input_digest=token_digest,
+            )
+            return MigrationItemResult(
+                index=index, status=MigrationStatus.FAILED, key_version=version,
+                target_version=target, ciphertext=None,
+                error_code=err.code.value, detail=detail,
+                input_digest=token_digest,
+            )
+
+        # 1. Structural validation.
+        try:
+            envelope = _parse_envelope(token)  # type: ignore[arg-type]
+        except CiphertextInvalidError as err:
+            return failed(err, getattr(err, "key_version", None), err.message)
+        except (TypeError, AttributeError) as exc:
+            err = CiphertextInvalidError(f"token must be a string: {exc}")
+            return failed(err, None, err.message)
+
+        version = envelope.key_version
+
+        # 2. Key-identity binding.
+        if envelope.key_id != self._key_id:
+            err = KeyIdMismatchError(version, expected=self._key_id,
+                                     actual=envelope.key_id)
+            return failed(err, version, err.message)
+
+        # 3. Optional context guard; otherwise reuse the bound context.
+        if expected_ctx is not None and envelope.context != expected_ctx:
+            err = ContextMismatchError(version)
+            return failed(err, version,
+                          "provided context differs from bound context")
+        ctx = envelope.context
+
+        # The remainder must be atomic w.r.t. lifecycle transitions: the
+        # target version is validated and used under the same lock, so a
+        # concurrent deactivate/revoke/rotate can never leave us emitting a
+        # ciphertext bound to an unusable target.
+        with self._lock:
+            # 4. Source version must exist and be decrypt-capable.
+            source_kv = self._ring.get(version)
+            if source_kv is None:
+                err = KeyVersionNotFoundError(version)
+                return failed(err, version,
+                              "embedded version absent from key ring")
+            if source_kv.state is KeyState.REVOKED:
+                err = KeyRevokedError(version, operation="migration")
+                return failed(err, version, "source version revoked")
+            if not source_kv.is_usable_for_decrypt():
+                err = KeyDeactivatedError(version, operation="migration")
+                return failed(err, version, "source version not decrypt-capable")
+
+            # 5. Target is the current version; it must be ACTIVE right now.
+            target_version = self._current_version
+            if target_version is None:
+                err = NoActiveKeyError(self._key_id)
+                return failed(err, version, "no current active key to migrate to")
+            target_kv = self._ring[target_version]
+            if target_kv.state is KeyState.REVOKED:
+                err = KeyRevokedError(target_version, operation="migration target")
+                return failed(err, version, "target version revoked",
+                              target=target_version)
+            if not target_kv.is_usable_for_encrypt():
+                err = KeyDeactivatedError(target_version, operation="migration target")
+                return failed(err, version, "target version not active",
+                              target=target_version)
+
+            # 6. Idempotent no-op: already on the current version. The token
+            #    is still AEAD-verified first — migration never vouches for a
+            #    forged "already current" token.
+            if version == target_version:
+                try:
+                    decrypt_envelope(target_kv.key_material, envelope)
+                except CiphertextTamperedError as err:
+                    return failed(err, version, "AEAD authentication failed",
+                                  target=target_version)
+                self._record_migrate_success(
+                    version, target_version, ctx, token_digest,
+                    detail="token already on current version; returned unchanged",
+                )
+                self._decision_log("MIGRATE", "already-current", version, None,
+                                   ctx.digest(), token_digest)
+                return MigrationItemResult(
+                    index=index, status=MigrationStatus.ALREADY_CURRENT,
+                    key_version=version, target_version=target_version,
+                    ciphertext=token if isinstance(token, str) else None,
+                    error_code=None,
+                    detail="already encrypted under the current version",
+                    input_digest=token_digest,
+                )
+
+            # 7. Decrypt with the source key, re-encrypt under the target key.
+            try:
+                plaintext = decrypt_envelope(source_kv.key_material, envelope)
+            except CiphertextTamperedError as err:
+                return failed(err, version, "AEAD authentication failed",
+                              target=target_version)
+            new_token = encrypt_envelope(
+                target_kv.key_material, self._key_id, target_version,
+                plaintext, ctx,
+            ).to_token()
+            del plaintext  # never leaves this scope
+
+        # 8. Success is only reported once its audit record is durable.
+        try:
+            self._record_migrate_success(
+                version, target_version, ctx, token_digest,
+                detail=f"re-encrypted from '{version}' to '{target_version}'",
+            )
+        except Exception as exc:  # noqa: BLE001 - audit failure fails the item
+            audit_err = AuditWriteFailedError(
+                f"migration succeeded cryptographically but its audit record "
+                f"could not be persisted: {exc}"
+            )
+            self._failure_record(
+                KeyOperation.MIGRATE, version, audit_err,
+                detail="audit write failed; new token withheld",
+                context_digest=ctx.digest(), input_digest=token_digest,
+            )
+            return MigrationItemResult(
+                index=index, status=MigrationStatus.FAILED, key_version=version,
+                target_version=target_version, ciphertext=None,
+                error_code=audit_err.code.value,
+                detail="audit write failed; migration result withheld",
+                input_digest=token_digest,
+            )
+        self._decision_log("MIGRATE", "success", version, None,
+                           ctx.digest(), token_digest)
+        return MigrationItemResult(
+            index=index, status=MigrationStatus.MIGRATED, key_version=version,
+            target_version=target_version, ciphertext=new_token, error_code=None,
+            detail=f"re-encrypted from '{version}' to '{target_version}'",
+            input_digest=token_digest,
+        )
+
+    def _record_migrate_success(
+        self,
+        source_version: str,
+        target_version: str,
+        ctx: EncryptionContext,
+        token_digest: str,
+        *,
+        detail: str,
+    ) -> None:
+        self._audit.append(
+            self._make_record(
+                KeyOperation.MIGRATE, OperationResult.SUCCESS, source_version, None,
+                detail=f"{detail} (target={target_version})",
+                context_digest=ctx.digest(), input_digest=token_digest,
+            )
+        )
 
     # ------------------------------------------------------------------ #
     # Introspection
