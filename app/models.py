@@ -33,6 +33,7 @@ class KeyOperation(str, Enum):
     ROTATE = "ROTATE"
     DEACTIVATE = "DEACTIVATE"
     REVOKE = "REVOKE"
+    MIGRATE = "MIGRATE"
 
 
 class OperationResult(str, Enum):
@@ -201,6 +202,99 @@ class EnvelopeCiphertext:
             tag=tag,
             context=context,
         )
+
+
+class MigrationStatus(str, Enum):
+    """Per-item outcome of a batch re-encryption migration."""
+
+    REENCRYPTED = "REENCRYPTED"        # upgraded from an older version
+    ALREADY_CURRENT = "ALREADY_CURRENT"  # idempotent: already on target
+    FAILED = "FAILED"                  # not upgraded; see error_code/reason
+
+
+@dataclass(frozen=True)
+class MigrationItem:
+    """One input entry of a migration batch.
+
+    ``context`` is optional: when omitted, the caller proves nothing and the
+    context already bound inside the token is used (pure server-side upgrade);
+    when provided it must equal the bound context, matching decrypt() rules.
+    """
+
+    ciphertext: str
+    context: EncryptionContext | None = None
+    item_id: str | None = None
+
+
+@dataclass(frozen=True)
+class MigrationItemResult:
+    """Per-item verdict; ``ciphertext`` carries the upgraded token on success.
+
+    Neither this object nor any log/audit line ever contains plaintext.
+    """
+
+    index: int
+    item_id: str | None
+    status: MigrationStatus
+    source_version: str | None
+    target_version: str | None
+    ciphertext: str | None
+    error_code: str | None
+    reason: str | None
+
+    @property
+    def ok(self) -> bool:
+        return self.status in (MigrationStatus.REENCRYPTED, MigrationStatus.ALREADY_CURRENT)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "index": self.index,
+            "item_id": self.item_id,
+            "status": self.status.value,
+            "source_version": self.source_version,
+            "target_version": self.target_version,
+            "ciphertext": self.ciphertext,
+            "error_code": self.error_code,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class MigrationReport:
+    """Full, item-by-item result of a migration batch."""
+
+    target_version: str
+    results: tuple[MigrationItemResult, ...]
+
+    @property
+    def total(self) -> int:
+        return len(self.results)
+
+    @property
+    def reencrypted_count(self) -> int:
+        return sum(1 for r in self.results if r.status is MigrationStatus.REENCRYPTED)
+
+    @property
+    def already_current_count(self) -> int:
+        return sum(1 for r in self.results if r.status is MigrationStatus.ALREADY_CURRENT)
+
+    @property
+    def failed_count(self) -> int:
+        return sum(1 for r in self.results if r.status is MigrationStatus.FAILED)
+
+    @property
+    def all_succeeded(self) -> bool:
+        return self.failed_count == 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "target_version": self.target_version,
+            "total": self.total,
+            "reencrypted": self.reencrypted_count,
+            "already_current": self.already_current_count,
+            "failed": self.failed_count,
+            "items": [r.to_dict() for r in self.results],
+        }
 
 
 @dataclass(frozen=True)

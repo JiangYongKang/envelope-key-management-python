@@ -25,6 +25,9 @@ class ErrorCode(str, Enum):
     AUDIT_WRITE_FAILED = "AUDIT_WRITE_FAILED"
     NO_ACTIVE_KEY = "NO_ACTIVE_KEY"
     INVALID_LIFECYCLE_TRANSITION = "INVALID_LIFECYCLE_TRANSITION"
+    STATE_PERSIST_FAILED = "STATE_PERSIST_FAILED"
+    STATE_INVALID = "STATE_INVALID"
+    MIGRATION_INCOMPLETE = "MIGRATION_INCOMPLETE"
 
 
 class KeyManagementError(Exception):
@@ -151,3 +154,33 @@ class KeyIdMismatchError(KeyManagementError):
         )
         self.expected = expected
         self.actual = actual
+
+
+class StatePersistFailedError(KeyManagementError):
+    """A lifecycle transition succeeded in memory but could not be durably
+    written to the local state file. The transition is rolled back so the
+    service never reports success for a change a restart would forget.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(ErrorCode.STATE_PERSIST_FAILED, message)
+
+
+class StateInvalidError(KeyManagementError):
+    """The persisted state file is unreadable, corrupt or incompatible."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(ErrorCode.STATE_INVALID, message)
+
+
+class MigrationIncompleteError(KeyManagementError):
+    """A batch migration finished with one or more items not upgraded.
+
+    The attached :class:`~app.models.MigrationReport` describes every item
+    individually, so callers can distinguish success, already-current and
+    each classified failure — a partial batch is never reported as success.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(ErrorCode.MIGRATION_INCOMPLETE, message)
+        self.report = None

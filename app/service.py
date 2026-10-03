@@ -36,6 +36,9 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.AUDIT_WRITE_FAILED: 500,
     ErrorCode.NO_ACTIVE_KEY: 503,
     ErrorCode.INVALID_LIFECYCLE_TRANSITION: 409,
+    ErrorCode.STATE_PERSIST_FAILED: 500,
+    ErrorCode.STATE_INVALID: 503,
+    ErrorCode.MIGRATION_INCOMPLETE: 409,
 }
 
 
@@ -58,6 +61,19 @@ class RotateRequest(BaseModel):
 
 class VersionAction(BaseModel):
     version: str = Field(min_length=1)
+
+
+class MigrateItem(BaseModel):
+    ciphertext: str = Field(min_length=1)
+    context: dict[str, str] | None = None
+    item_id: str | None = None
+
+
+class MigrateRequest(BaseModel):
+    # Each entry is a bare token (server-side upgrade reusing the bound
+    # context) or a full item with an optional verifying context / item_id.
+    items: list[str | MigrateItem] = Field(min_length=0)
+    context: dict[str, str] | None = None
 
 
 def create_app(
@@ -141,5 +157,37 @@ def create_app(
         manager = manager_provider()
         plaintext = manager.decrypt(body.ciphertext, body.context)
         return {"plaintext": plaintext.decode("utf-8")}
+
+    @app.post("/keys/migrate")
+    async def migrate(body: MigrateRequest):
+        """Batch-upgrade historical ciphertexts to the current version.
+
+        200 when every item is REENCRYPTED/ALREADY_CURRENT; 409
+        MIGRATION_INCOMPLETE when at least one item failed — the same
+        per-item report is returned in both cases (no plaintext ever).
+        """
+        manager = manager_provider()
+        raw_items = [
+            item if isinstance(item, str) else item.model_dump(exclude_none=True)
+            for item in body.items
+        ]
+        report = manager.migrate(raw_items, body.context)
+        content = {"report": report.to_dict()}
+        if not report.all_succeeded:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "error": {
+                        "code": "MIGRATION_INCOMPLETE",
+                        "message": (
+                            f"{report.failed_count} of {report.total} item(s) could "
+                            "not be migrated; see report.items for per-item reasons"
+                        ),
+                        "key_version": report.target_version,
+                    },
+                    **content,
+                },
+            )
+        return content
 
     return app

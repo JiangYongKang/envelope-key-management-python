@@ -77,6 +77,56 @@ def test_env_key_file_shorthand(tmp_path):
     log_case("config-env-keyfile")
 
 
+def test_state_path_enables_durability_across_rebuild(tmp_path):
+    keys = tmp_path / "keys.json"
+    _keys_file(keys, "ACTIVE")
+    state = tmp_path / "state.json"
+    env = {
+        "EKM_KEY_FILE": str(keys),
+        "EKM_KEY_ID": "envkg",
+        "EKM_STATE_PATH": str(state),
+    }
+    manager = build_manager(load_settings(env))
+    manager.rotate()
+    assert manager.current_version() == "v2"
+
+    restarted = build_manager(load_settings(env))
+    log_case("config-state-path", current=restarted.current_version(),
+             persisted=state.exists())
+    assert restarted.current_version() == "v2"
+
+
+def test_state_path_in_config_file(tmp_path):
+    keys = tmp_path / "keys.json"
+    _keys_file(keys, "ACTIVE")
+    cfg = tmp_path / "config.json"
+    state = tmp_path / "state.json"
+    cfg.write_text(json.dumps({
+        "key_id": "kg",
+        "key_source": {"type": "file", "path": str(keys)},
+        "state_path": str(state),
+    }))
+    settings = load_settings({"EKM_CONFIG_FILE": str(cfg)})
+    assert settings.state_path == str(state)
+    build_manager(settings).rotate()
+    assert state.exists()
+    log_case("config-state-file-path")
+
+
+def test_blank_state_path_rejected(tmp_path):
+    keys = tmp_path / "keys.json"
+    _keys_file(keys, "ACTIVE")
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps({
+        "key_id": "kg",
+        "key_source": {"type": "file", "path": str(keys)},
+        "state_path": "",
+    }))
+    with pytest.raises(ConfigurationError):
+        load_settings({"EKM_CONFIG_FILE": str(cfg)})
+    log_case("config-blank-state-path")
+
+
 def test_mutually_exclusive_env_sources(tmp_path):
     keys = tmp_path / "keys.json"
     _keys_file(keys, "ACTIVE")

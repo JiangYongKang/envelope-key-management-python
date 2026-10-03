@@ -17,6 +17,7 @@ Configuration sources (explicitly local only):
        EKM_INLINE_KEYS_JSON_FILE=./local-keys.json   (JSON list of versions)
        EKM_KEY_FILE=./local-keys.json                ({"versions": [...]})
        EKM_AUDIT_PATH=./audit.jsonl                  (optional)
+       EKM_STATE_PATH=./ekm-state.json              (optional, enables durability)
 
 There is no network source and no hard-coded default key: if no source can be
 resolved, or the source is incomplete, :class:`ConfigurationError` is raised.
@@ -32,6 +33,7 @@ from .audit import AuditLogger, NullAuditLogger
 from .errors import ConfigurationError
 from .key_source import FileKeySource, InlineKeySource, LocalKeySource
 from .manager import KeyManager
+from .state import FileStateStore, InMemoryStateStore, StateStore
 
 
 @dataclass(frozen=True)
@@ -39,6 +41,7 @@ class Settings:
     key_id: str
     key_source: LocalKeySource
     audit_path: str | None
+    state_path: str | None = None
 
 
 def _read_json_file(path: str, *, what: str) -> object:
@@ -85,10 +88,14 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         audit_path = document.get("audit_path")
         if audit_path is not None and (not isinstance(audit_path, str) or not audit_path):
             raise ConfigurationError("'audit_path' must be a non-empty string when provided")
+        state_path = document.get("state_path")
+        if state_path is not None and (not isinstance(state_path, str) or not state_path):
+            raise ConfigurationError("'state_path' must be a non-empty string when provided")
         return Settings(
             key_id=cfg_key_id,
             key_source=_build_key_source(document["key_source"]),
             audit_path=audit_path,
+            state_path=state_path,
         )
 
     inline_keys_file = environ.get("EKM_INLINE_KEYS_JSON_FILE")
@@ -103,12 +110,17 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
             raise ConfigurationError(
                 f"inline keys file '{inline_keys_file}' must contain a JSON list"
             )
-        return Settings(key_id, InlineKeySource(entries), environ.get("EKM_AUDIT_PATH"))
+        return Settings(
+            key_id, InlineKeySource(entries),
+            environ.get("EKM_AUDIT_PATH"),
+            environ.get("EKM_STATE_PATH"),
+        )
     if key_file:
         return Settings(
             key_id,
             FileKeySource(key_file),
             environ.get("EKM_AUDIT_PATH"),
+            environ.get("EKM_STATE_PATH"),
         )
 
     raise ConfigurationError(
@@ -131,4 +143,11 @@ def build_manager(settings: Settings | None = None) -> KeyManager:
         audit = AuditLogger(settings.audit_path)
     else:
         audit = NullAuditLogger()
-    return KeyManager(settings.key_id, settings.key_source, audit)
+    state_store: StateStore
+    if settings.state_path:
+        state_store = FileStateStore(settings.state_path)
+    else:
+        state_store = InMemoryStateStore()
+    return KeyManager(
+        settings.key_id, settings.key_source, audit, state_store=state_store
+    )

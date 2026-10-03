@@ -72,3 +72,51 @@ def test_http_response_never_leaks_material(client):
     body = json.dumps(r.json())
     assert "TOPSECRET" not in body
     log_case("http-no-leak")
+
+
+def test_http_migrate_batch_success_and_partial_failure(client):
+    # Two legacy tokens on v1.
+    t1 = client.post("/encrypt", json={"plaintext": "one", "context": {"t": "a"}}).json()["ciphertext"]
+    t2 = client.post("/encrypt", json={"plaintext": "two", "context": {}}).json()["ciphertext"]
+    assert client.post("/keys/rotate", json={}).status_code == 201
+
+    # Bare-token batch: server reuses each bound context.
+    r = client.post("/keys/migrate", json={"items": [t1, t2]})
+    assert r.status_code == 200, r.text
+    report = r.json()["report"]
+    assert report["target_version"] == "v2"
+    assert report["reencrypted"] == 2 and report["failed"] == 0
+    upgraded = report["items"][0]["ciphertext"]
+    assert client.post("/decrypt", json={"ciphertext": upgraded, "context": {"t": "a"}}
+                       ).json()["plaintext"] == "one"
+    log_case("http-migrate-ok", total=report["total"])
+
+    # Partial failure -> 409 MIGRATION_INCOMPLETE with per-item report attached.
+    r2 = client.post("/keys/migrate", json={"items": [
+        {"ciphertext": upgraded},                         # already current
+        {"ciphertext": "garbage"},                         # invalid
+        {"ciphertext": t1, "context": {"t": "other"}},     # context mismatch
+    ]})
+    assert r2.status_code == 409, r2.text
+    payload = r2.json()
+    assert payload["error"]["code"] == "MIGRATION_INCOMPLETE"
+    statuses = [i["status"] for i in payload["report"]["items"]]
+    assert statuses == ["ALREADY_CURRENT", "FAILED", "FAILED"]
+    codes = [i["error_code"] for i in payload["report"]["items"]]
+    assert codes[1] == "CIPHERTEXT_INVALID" and codes[2] == "CONTEXT_MISMATCH"
+    log_case("http-migrate-partial", statuses=statuses)
+
+
+def test_http_migrate_with_batch_default_context(client):
+    token = client.post("/encrypt", json={"plaintext": "ctx", "context": {"t": "a"}}).json()["ciphertext"]
+    client.post("/keys/rotate", json={})
+    r = client.post("/keys/migrate", json={
+        "items": [token], "context": {"t": "a"},
+    })
+    assert r.status_code == 200
+    bad = client.post("/keys/migrate", json={
+        "items": [token], "context": {"t": "WRONG"},
+    })
+    assert bad.status_code == 409
+    assert bad.json()["report"]["items"][0]["error_code"] == "CONTEXT_MISMATCH"
+    log_case("http-migrate-default-context")
