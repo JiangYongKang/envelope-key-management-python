@@ -29,7 +29,7 @@ app/
   service.py     # FastAPI 入口与错误码 -> HTTP 状态映射
   cli.py         # 本地密钥文件生成：python -m app.cli
 main.py          # uvicorn 入口（缺配置时启动期明确拒绝）
-tests/           # 106 个 pytest 用例，含并发轮换/迁移/重启一致性场景
+tests/           # 115 个 pytest 用例，含并发轮换/迁移/重启一致性场景
 examples/        # 配置示例
 docs/            # 架构与密钥层级说明
 ```
@@ -110,6 +110,13 @@ curl -s -XPOST localhost:8000/keys/migrate -H 'content-type: application/json' \
   内存状态同步回滚——宁可明确失败，也不出现“运行期以为成功、重启后丢失”。
 - **快照校验**：快照的 `key_id` 与服务配置不符、或快照损坏时，启动期抛
   `CONFIG_INVALID`，拒绝带错误状态运行。
+- **一致性校验（与首次引导同源）**：加载快照时强制“恰有一个 ACTIVE 版本且它就是
+  当前版本”——与首次从密钥来源引导时的校验完全对齐。快照里出现多个 ACTIVE
+  版本、没有任何 ACTIVE 版本、或当前版本指针与唯一 ACTIVE 版本不符（例如手工
+  恢复/整理落盘状态后遗留两个“生效”版本）时，启动期抛 `STATE_INCONSISTENT`
+  并拒绝启动；不会静默加载、不会顺手“修好”，也不会悄悄退回旧版本，落盘文件
+  保持原样，需人工修复或删除快照后再启动。合法历史状态（当前版本 ACTIVE、
+  历史版本 DEACTIVATED/REVOKED）不受影响的照常启动。
 - 未配置 `state_path` 时使用内存态存储（仅建议测试/临时部署）：运行期行为一致，
   但重启后回到密钥来源的初始状态。
 
@@ -130,7 +137,7 @@ curl -s -XPOST localhost:8000/keys/migrate -H 'content-type: application/json' \
 | `NO_ACTIVE_KEY` | 无可用的当前 ACTIVE 版本用于加密 | 503 |
 | `AUDIT_WRITE_FAILED` | 审计无法持久化；成功操作因此不返回成功 | 500 |
 | `STATE_PERSIST_FAILED` | 密钥环状态无法落盘；本次操作整体失败并回滚 | 500 |
-| `STATE_PERSIST_FAILED` | 密钥环状态无法落盘；本次操作整体失败并回滚 | 500 |
+| `STATE_INCONSISTENT` | 持久化快照自相矛盾（多个/零个 ACTIVE、当前指针不符）；拒绝启动 | 503 |
 
 判定顺序（解密）：**结构合法 → key id 一致 → 上下文一致 → 版本存在/状态允许 →
 AEAD 认证**。每一环节失败都给出对应错误码，且立即终止。迁移对每条令牌采用同一套
@@ -197,11 +204,25 @@ uv run pytest --log-cli-level=DEBUG             # 打印输入摘要 + 判定依
 uv run pytest tests/test_rotation_concurrency.py
 uv run pytest tests/test_migration.py tests/test_restart_persistence.py \
   tests/test_migration_concurrency.py           # 迁移 / 重启一致性 / 并发迁移
+uv run pytest tests/test_restart_state_integrity.py \
+  --log-cli-level=INFO                          # 重启一致性校验（含 CASE 摘要日志）
+```
+
+本地验证“不一致快照拒绝启动”：
+
+```bash
+# 1. 正常启动并轮换一次，使 ekm-state.json 含 v1(DEACTIVATED)+v2(ACTIVE)
+# 2. 手工把快照里 v1 的 state 改回 "ACTIVE"（模拟恢复/整理出的矛盾状态）
+# 3. 重启服务：启动期失败并提示
+#    [STATE_INCONSISTENT] persisted key-ring state ... has 2 ACTIVE versions
+#    ['v1', 'v2']; exactly one version may be ACTIVE (the current one)...
+#    快照文件保持原样，修复或删除 EKM_STATE_PATH 指向的文件后才能启动。
 ```
 
 测试覆盖：轮换期间并发解密、并行轮换去重、乐观 CAS 轮换、密文篡改、上下文不匹配、
 版本缺失、跨密钥环、已撤销密钥、非法生命周期迁移、审计与真实结果一致性、
 配置缺失/不完整拒绝启用，以及新增的：批量迁移逐条分类、迁移幂等、迁移不出明文、
 目标版本不可用时明确失败、轮换/撤销/迁移结果重启后仍成立、落盘失败整体回滚、
-并发迁移与轮换/撤销/加解密混合负载。日志中 `CASE ... inputs=...` 为输入摘要，
-`decision ... reason=...` 为判定依据。
+并发迁移与轮换/撤销/加解密混合负载、持久化状态自相矛盾（多个/零个 ACTIVE、
+当前指针不符）拒绝启动且文件不被改写、合法历史状态重启后当前版本不回退。
+日志中 `CASE ... inputs=...` 为输入摘要，`decision ... reason=...` 为判定依据。

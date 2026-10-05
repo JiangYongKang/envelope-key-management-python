@@ -24,6 +24,7 @@ class ErrorCode(str, Enum):
     ROTATION_RACE = "ROTATION_RACE"
     AUDIT_WRITE_FAILED = "AUDIT_WRITE_FAILED"
     STATE_PERSIST_FAILED = "STATE_PERSIST_FAILED"
+    STATE_INCONSISTENT = "STATE_INCONSISTENT"
     NO_ACTIVE_KEY = "NO_ACTIVE_KEY"
     INVALID_LIFECYCLE_TRANSITION = "INVALID_LIFECYCLE_TRANSITION"
 
@@ -127,6 +128,19 @@ class StatePersistFailedError(KeyManagementError):
 
     def __init__(self, message: str) -> None:
         super().__init__(ErrorCode.STATE_PERSIST_FAILED, message)
+
+
+class PersistedStateInconsistentError(ConfigurationError):
+    """Raised when a persisted key-ring snapshot violates a ring invariant.
+
+    Distinct from plain CONFIG_INVALID so operators can tell "the persisted
+    state on disk is self-contradictory" apart from "the configuration is
+    missing/incomplete". The service refuses to start; the snapshot is never
+    silently repaired or rolled back to an older version.
+    """
+
+    def __init__(self, message: str) -> None:
+        KeyManagementError.__init__(self, ErrorCode.STATE_INCONSISTENT, message)
 
 
 class NoActiveKeyError(KeyManagementError):

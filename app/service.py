@@ -35,6 +35,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.ROTATION_RACE: 409,
     ErrorCode.AUDIT_WRITE_FAILED: 500,
     ErrorCode.STATE_PERSIST_FAILED: 500,
+    ErrorCode.STATE_INCONSISTENT: 503,
     ErrorCode.NO_ACTIVE_KEY: 503,
     ErrorCode.INVALID_LIFECYCLE_TRANSITION: 409,
 }

@@ -116,6 +116,15 @@ b"EKM-v1" | u16(len(kid)) | kid | u16(len(ver)) | ver | canonical(ctx)
   保证崩溃不留下半写的快照；文件权限 0600。
 - 启动顺序：`load()` 有快照 → 校验 `key_id` 一致后以快照为准（密钥来源不再参与）；
   无快照 → 从密钥来源引导并立即落盘初始快照（落盘失败拒绝启动）。
+- 重启一致性校验（`KeyManager._validate_snapshot_invariants`，对任意
+  `KeyStateStore` 实现生效）：快照必须满足“恰有一个 ACTIVE 版本且它就是当前
+  版本”——与首次从密钥来源引导时的校验（无 ACTIVE 或多个 ACTIVE 均拒绝）同源。
+  多个 ACTIVE、零个 ACTIVE、或当前版本指针与唯一 ACTIVE 版本不符时，启动期抛
+  `STATE_INCONSISTENT`（`PersistedStateInconsistentError`，`ConfigurationError`
+  的子类，可与普通配置错误区分）并整次拒绝启动：不静默加载、不自动修复、
+  不回退旧版本，落盘文件保持原样，需人工修复或删除快照。`FileStateStore`
+  解析阶段的“当前版本必须 ACTIVE”检查同样以该错误码报告。合法历史状态
+  （当前 ACTIVE、历史 DEACTIVATED/REVOKED）照常启动，当前版本不回退。
 - rotate/deactivate/revoke 的提交流程：改内存 → `save()` 落盘 → 写审计；
   落盘失败回滚内存并抛 `STATE_PERSIST_FAILED`；审计失败回滚内存并尽力把旧快照
   重新落盘。任何情况下“返回成功”都意味着磁盘上已是新状态。

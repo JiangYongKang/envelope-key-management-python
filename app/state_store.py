@@ -28,7 +28,11 @@ import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-from .errors import ConfigurationError, StatePersistFailedError
+from .errors import (
+    ConfigurationError,
+    PersistedStateInconsistentError,
+    StatePersistFailedError,
+)
 from .models import KeyState, b64d, b64e
 
 _KEY_SIZE = 32
@@ -179,9 +183,10 @@ class FileStateStore(KeyStateStore):
             )
         current_state = next(v.state for v in versions if v.version == current)
         if current_state is not KeyState.ACTIVE:
-            raise ConfigurationError(
+            raise PersistedStateInconsistentError(
                 f"{where}: current version '{current}' is {current_state.value}; "
-                "a snapshot's current version must be ACTIVE"
+                "a snapshot's current version must be ACTIVE — the persisted "
+                "state is inconsistent and the service refuses to start"
             )
         return RingSnapshot(
             key_id=key_id, current_version=current, versions=tuple(versions)

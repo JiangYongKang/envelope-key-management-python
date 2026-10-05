@@ -36,6 +36,7 @@ from .errors import (
     KeyRevokedError,
     KeyVersionNotFoundError,
     NoActiveKeyError,
+    PersistedStateInconsistentError,
     RotationRaceError,
 )
 from .key_source import LocalKeySource, generate_local_key
@@ -114,6 +115,7 @@ class KeyManager:
                     f"state store snapshot belongs to key id '{snapshot.key_id}' "
                     f"but this service is configured for '{self._key_id}'"
                 )
+            self._validate_snapshot_invariants(snapshot)
             self._ring = {
                 v.version: KeyVersion(
                     version=v.version,
@@ -169,6 +171,34 @@ class KeyManager:
             "key manager bootstrapped key_id=%s current=%s versions=%d",
             self._key_id, self._current_version, len(self._ring),
         )
+
+    def _validate_snapshot_invariants(self, snapshot: RingSnapshot) -> None:
+        """Refuse to boot from a self-contradictory persisted ring.
+
+        Same invariant enforced when first bootstrapping from the key
+        source: at any moment there is exactly one ACTIVE version and it is
+        the current one. A snapshot that violates this (e.g. an old version
+        left ACTIVE alongside the current one after manual edits, or a
+        current pointer that does not match the ACTIVE version) is
+        inconsistent persisted state — startup fails with
+        STATE_INCONSISTENT. The snapshot is never silently repaired,
+        auto-healed or rolled back to an older version.
+        """
+        active = [v.version for v in snapshot.versions if v.state is KeyState.ACTIVE]
+        if len(active) != 1:
+            raise PersistedStateInconsistentError(
+                f"persisted key-ring state for key '{snapshot.key_id}' has "
+                f"{len(active)} ACTIVE versions {active}; exactly one version "
+                "may be ACTIVE (the current one). The snapshot is "
+                "inconsistent: repair or remove it before restarting."
+            )
+        if snapshot.current_version != active[0]:
+            raise PersistedStateInconsistentError(
+                f"persisted key-ring state for key '{snapshot.key_id}' marks "
+                f"'{snapshot.current_version}' as current but the only ACTIVE "
+                f"version is '{active[0]}'. The snapshot is inconsistent: "
+                "repair or remove it before restarting."
+            )
 
     @staticmethod
     def _initial_sequence(labels: list[str]) -> int:
