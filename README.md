@@ -29,7 +29,7 @@ app/
   service.py     # FastAPI 入口与错误码 -> HTTP 状态映射
   cli.py         # 本地密钥文件生成：python -m app.cli
 main.py          # uvicorn 入口（缺配置时启动期明确拒绝）
-tests/           # 106 个 pytest 用例，含并发轮换/迁移/重启一致性场景
+tests/           # 113 个 pytest 用例，含并发轮换/迁移/重启一致性与重启状态校验场景
 examples/        # 配置示例
 docs/            # 架构与密钥层级说明
 ```
@@ -106,9 +106,20 @@ curl -s -XPOST localhost:8000/keys/migrate -H 'content-type: application/json' \
   启动时使用；即使源配置仍写着旧的 `v1 ACTIVE`，重启后当前版本仍是快照里的最新版。
 - **迁移结果同样成立**：迁移过的新令牌、未迁移的历史令牌在重启后按各自规则
   可解密（`ACTIVE`/`DEACTIVATED`）或被拒绝（`REVOKED`）。
+- **快照一致性校验**：加载持久化快照时，除了结构合法（JSON/字段/key material），
+  还会执行与首次引导密钥时**完全相同**的密钥环不变量校验：
+  1. 全环**恰好一个** `ACTIVE`（可加密）版本——0 个或多个都不行；
+  2. `current_version` 必须指向那个唯一的 `ACTIVE` 版本。
+
+  任一不满足（例如人工恢复/整理快照后旧版本也停留在 `ACTIVE`，或 current 指向
+  停用/撤销版本）都会让**整次启动失败**，抛 `PERSISTED_STATE_INVALID`：它与
+  `CONFIG_INVALID` 明确区分，表示“本地配置没问题，是这份持久化状态本身不一致”，
+  错误信息点名违例版本（如 `2 versions are ACTIVE ['v1', 'v3']`）。服务不会静默
+  加载、不会自动“修好”（坏快照原样保留）、也不会悄悄退回密钥来源的旧版本。
+  合法历史状态（current 唯一 ACTIVE，其余为停用/撤销）照常启动、不回退。
 - **落盘失败即整体失败**：状态无法持久化时本次操作抛出 `STATE_PERSIST_FAILED`，
   内存状态同步回滚——宁可明确失败，也不出现“运行期以为成功、重启后丢失”。
-- **快照校验**：快照的 `key_id` 与服务配置不符、或快照损坏时，启动期抛
+- **快照损坏**：快照的 `key_id` 与服务配置不符、或 JSON/字段结构损坏时，启动期抛
   `CONFIG_INVALID`，拒绝带错误状态运行。
 - 未配置 `state_path` 时使用内存态存储（仅建议测试/临时部署）：运行期行为一致，
   但重启后回到密钥来源的初始状态。
@@ -130,7 +141,7 @@ curl -s -XPOST localhost:8000/keys/migrate -H 'content-type: application/json' \
 | `NO_ACTIVE_KEY` | 无可用的当前 ACTIVE 版本用于加密 | 503 |
 | `AUDIT_WRITE_FAILED` | 审计无法持久化；成功操作因此不返回成功 | 500 |
 | `STATE_PERSIST_FAILED` | 密钥环状态无法落盘；本次操作整体失败并回滚 | 500 |
-| `STATE_PERSIST_FAILED` | 密钥环状态无法落盘；本次操作整体失败并回滚 | 500 |
+| `PERSISTED_STATE_INVALID` | 重启加载的持久化状态违反密钥环不变量（多个 ACTIVE / current 非唯一 ACTIVE / 无 ACTIVE）；拒绝启动，不静默加载、不修复、不回退 | 503 |
 
 判定顺序（解密）：**结构合法 → key id 一致 → 上下文一致 → 版本存在/状态允许 →
 AEAD 认证**。每一环节失败都给出对应错误码，且立即终止。迁移对每条令牌采用同一套
@@ -189,6 +200,45 @@ curl -s -XPOST localhost:8000/keys/migrate -H 'content-type: application/json' \
 # 重启服务后 /keys/versions 仍显示最新当前版本（EKM_STATE_PATH 生效）
 ```
 
+### 快照一致性校验（手工复现）
+
+启动后做一次轮换，然后人为把旧版本在状态文件里改回 `ACTIVE`（模拟恢复/整理快照
+后留下的矛盾状态），再重启：
+
+```bash
+uv run python - <<'PY'
+import json
+from app.config import build_manager, load_settings
+
+# 先正常轮换一次，落盘 ekm-state.json（v1 DEACTIVATED, v2 ACTIVE current）
+m = build_manager(load_settings())
+m.rotate()
+
+doc = json.load(open("ekm-state.json"))
+for v in doc["versions"]:
+    if v["version"] == "v1":
+        v["state"] = "ACTIVE"          # 人为制造两个 ACTIVE
+json.dump(doc, open("ekm-state.json", "w"))
+
+# 模拟重启：必须拒绝启动
+build_manager(load_settings())
+PY
+```
+
+预期直接失败、服务不启动，原因清晰可区分（注意是 `PERSISTED_STATE_INVALID`，
+不是 `CONFIG_INVALID`），且点名违例版本：
+
+```text
+refusing to start: inconsistent persisted state key_id=primary: persisted state
+snapshot for key id 'primary': 2 versions are ACTIVE ['v1', 'v2']; exactly one
+version may be ACTIVE at any time
+[PERSISTED_STATE_INVALID] persisted state snapshot for key id 'primary': 2
+versions are ACTIVE ['v1', 'v2']; exactly one version may be ACTIVE at any time
+```
+
+状态文件保持原样（不会被自动“修好”）；把 v1 改回 `DEACTIVATED` 后即可正常重启，
+current 仍是 `v2`、不回退。
+
 ### 测试
 
 ```bash
@@ -196,12 +246,17 @@ uv run pytest                                   # 全部用例
 uv run pytest --log-cli-level=DEBUG             # 打印输入摘要 + 判定依据
 uv run pytest tests/test_rotation_concurrency.py
 uv run pytest tests/test_migration.py tests/test_restart_persistence.py \
-  tests/test_migration_concurrency.py           # 迁移 / 重启一致性 / 并发迁移
+  tests/test_restart_state_invariant.py \
+  tests/test_migration_concurrency.py           # 迁移 / 重启一致性 / 重启状态校验 / 并发迁移
 ```
 
 测试覆盖：轮换期间并发解密、并行轮换去重、乐观 CAS 轮换、密文篡改、上下文不匹配、
 版本缺失、跨密钥环、已撤销密钥、非法生命周期迁移、审计与真实结果一致性、
 配置缺失/不完整拒绝启用，以及新增的：批量迁移逐条分类、迁移幂等、迁移不出明文、
 目标版本不可用时明确失败、轮换/撤销/迁移结果重启后仍成立、落盘失败整体回滚、
+**重启加载持久化状态的密钥环不变量校验（多个 ACTIVE / current 指向非 ACTIVE /
+0 个 ACTIVE 一律以 `PERSISTED_STATE_INVALID` 拒绝启动；不静默加载、不自动修复、
+不回退来源；合法历史状态正常重启且 current 不回退、历史密文规则不变）**、
 并发迁移与轮换/撤销/加解密混合负载。日志中 `CASE ... inputs=...` 为输入摘要，
-`decision ... reason=...` 为判定依据。
+`decision ... reason=...` 为判定依据；重启拒启动场景另会打印
+`refusing to start: inconsistent persisted state ...` 的 ERROR 行与违例版本。

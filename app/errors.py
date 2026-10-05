@@ -26,6 +26,7 @@ class ErrorCode(str, Enum):
     STATE_PERSIST_FAILED = "STATE_PERSIST_FAILED"
     NO_ACTIVE_KEY = "NO_ACTIVE_KEY"
     INVALID_LIFECYCLE_TRANSITION = "INVALID_LIFECYCLE_TRANSITION"
+    PERSISTED_STATE_INVALID = "PERSISTED_STATE_INVALID"
 
 
 class KeyManagementError(Exception):
@@ -163,3 +164,19 @@ class KeyIdMismatchError(KeyManagementError):
         )
         self.expected = expected
         self.actual = actual
+
+
+class PersistedStateInvalidError(KeyManagementError):
+    """Raised at startup when the persisted key-ring snapshot is internally
+    inconsistent (e.g. more than one ACTIVE version, or the current pointer not
+    pointing at the unique ACTIVE version).
+
+    This is deliberately distinct from :class:`ConfigurationError`: the local
+    configuration is fine — the *persisted state itself* violates the ring
+    invariants. The service refuses to start rather than silently loading,
+    "repairing", or falling back to the key source; operators must inspect the
+    snapshot at ``state_path``.
+    """
+
+    def __init__(self, message: str) -> None:
+        super().__init__(ErrorCode.PERSISTED_STATE_INVALID, message)

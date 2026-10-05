@@ -37,6 +37,7 @@ _STATUS_BY_CODE: dict[ErrorCode, int] = {
     ErrorCode.STATE_PERSIST_FAILED: 500,
     ErrorCode.NO_ACTIVE_KEY: 503,
     ErrorCode.INVALID_LIFECYCLE_TRANSITION: 409,
+    ErrorCode.PERSISTED_STATE_INVALID: 503,
 }
 
 

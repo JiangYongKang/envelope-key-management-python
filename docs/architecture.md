@@ -79,7 +79,9 @@ b"EKM-v1" | u16(len(kid)) | kid | u16(len(ver)) | ver | canonical(ctx)
 ```
 
 - 每次 `rotate()`：新键置 `ACTIVE` 并成为 current；旧 current 置 `DEACTIVATED`。
-- 同一时刻恰好一个 current ACTIVE 版本；启动时源中 0 个或 >1 个 ACTIVE 都拒绝启动。
+- 同一时刻**恰好一个** `ACTIVE` 版本，且它必须就是 current；首次引导（密钥来源）
+  与每次重启（持久化快照）使用**同一个不变量校验**，0 个或 >1 个 ACTIVE、
+  或 current 指针不指向唯一 ACTIVE 版本时都拒绝启动（见第 7 节）。
 - `REVOKED` 为终态；对 current 直接 revoke / deactivate 均为非法迁移。
 - 重复 `revoke()` 幂等（记录“already in target state”的成功审计，不重复改状态）。
 
@@ -114,13 +116,40 @@ b"EKM-v1" | u16(len(kid)) | kid | u16(len(ver)) | ver | canonical(ctx)
 
 - `FileStateStore.save()`：写临时文件 → fsync → `os.replace` → 目录 fsync，
   保证崩溃不留下半写的快照；文件权限 0600。
-- 启动顺序：`load()` 有快照 → 校验 `key_id` 一致后以快照为准（密钥来源不再参与）；
-  无快照 → 从密钥来源引导并立即落盘初始快照（落盘失败拒绝启动）。
+- 启动顺序：`load()` 有快照 → 校验 `key_id` 一致与**密钥环不变量**后以快照为准
+  （密钥来源不再参与）；无快照 → 从密钥来源引导并立即落盘初始快照（落盘失败拒绝启动）。
 - rotate/deactivate/revoke 的提交流程：改内存 → `save()` 落盘 → 写审计；
   落盘失败回滚内存并抛 `STATE_PERSIST_FAILED`；审计失败回滚内存并尽力把旧快照
   重新落盘。任何情况下“返回成功”都意味着磁盘上已是新状态。
 - 未配置 `state_path` 时使用 `InMemoryStateStore`：行为一致但重启后回到来源配置，
   仅建议测试/临时部署。
+
+### 7.1 重启加载持久化状态时的一致性校验
+
+快照能被 JSON 解析、字段结构完整只代表**结构合法**；在内存环生效前，管理器还会
+对快照执行与首次引导**完全相同**的密钥环不变量校验
+（`state_store.validate_ring_invariant`，两条启动路径共用同一份规则）：
+
+1. 全环**恰好一个** `ACTIVE`（可加密）版本：
+   - 0 个 ACTIVE → 拒绝启动；
+   - 超过 1 个 ACTIVE（例如人工恢复/整理快照时把旧版本也留在了 ACTIVE）→ 拒绝启动；
+2. `current_version` 必须存在且指向那个**唯一的** ACTIVE 版本：
+   - 指向环内不存在的版本 → 结构阶段即以 `CONFIG_INVALID` 拒绝；
+   - 指向 `DEACTIVATED`/`REVOKED` 版本，而另有别的 ACTIVE 版本 → 拒绝启动。
+
+不满足时的行为：
+
+- **整次启动失败**，抛 `PERSISTED_STATE_INVALID`（与配置问题 `CONFIG_INVALID`
+  明确区分：本地配置没问题，是这份持久化状态本身自相矛盾），错误信息会点名
+  违例版本（如 `2 versions are ACTIVE ['v1', 'v3']`），并打一条
+  `refusing to start: inconsistent persisted state ...` 的 ERROR 日志。
+- **不静默加载**、**不顺手“修好”**（快照文件原样保留，便于排查）、**不悄悄退回**
+  密钥来源的旧版本——即使来源配置本身合法也不用它顶替。
+- 合法历史状态（current 为唯一 ACTIVE，其余版本为 DEACTIVATED/REVOKED）照常启动，
+  current 仍是快照中的最新版本、不回退；历史密文按各自状态可解密（ACTIVE/
+  DEACTIVATED）或被拒绝（REVOKED），这些行为不受加固影响。
+
+本地验证见 README「快照一致性校验」一节。
 
 ## 8. 本地密钥来源与配置
 

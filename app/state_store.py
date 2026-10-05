@@ -17,6 +17,13 @@ Semantics
 * When ``save()`` fails the manager rolls its in-memory state back and
   reports :class:`StatePersistFailedError` — an operation is only allowed to
   succeed when its outcome is actually on disk.
+* Structural parsing (JSON shape, fields, key material) happens in this
+  module; the semantic *ring invariant* — exactly one ACTIVE version and the
+  current pointer targeting it — is checked by
+  :func:`validate_ring_invariant` and enforced by the manager on **every**
+  boot path. A structurally parsable snapshot that breaks the invariant makes
+  startup fail with :class:`PersistedStateInvalidError`: it is never silently
+  loaded, auto-repaired, or replaced by the key source.
 
 No network IO: snapshots live in one local JSON file (mode 0600).
 """
@@ -26,6 +33,7 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .errors import ConfigurationError, StatePersistFailedError
@@ -49,6 +57,63 @@ class RingSnapshot:
     key_id: str
     current_version: str
     versions: tuple[VersionSnapshot, ...]
+
+
+def validate_ring_invariant(
+    current_version: str | None,
+    versions: Iterable[tuple[str, KeyState]],
+    *,
+    where: str = "key ring",
+) -> str | None:
+    """Check the single-current-version invariant shared by every code path.
+
+    The same rule must hold both on first boot (from the configured key
+    source, which carries no current pointer — pass ``current_version=None``)
+    and on every restart (from the persisted snapshot):
+
+    * **exactly one** version is ``ACTIVE`` (encrypt-capable) at any time;
+    * the current-version pointer, when one exists, must point at that unique
+      ``ACTIVE`` version.
+
+    Returns a human-readable reason string when the invariant is violated,
+    otherwise ``None``. This function never raises and never mutates input —
+    callers decide which classified error to surface
+    (:class:`ConfigurationError` on first boot,
+    :class:`PersistedStateInvalidError` when restoring persisted state), so a
+    bad persisted snapshot is never silently loaded, auto-repaired, or
+    replaced with a fall-back ring.
+    """
+    entries = list(versions)
+    labels = {version for version, _state in entries}
+    active = sorted(version for version, state in entries if state is KeyState.ACTIVE)
+
+    if len(active) == 0:
+        return (
+            f"{where}: no ACTIVE key version exists"
+            + (
+                f" while current version is '{current_version}'"
+                if current_version is not None
+                else ""
+            )
+            + "; exactly one current ACTIVE version is required"
+        )
+    if len(active) > 1:
+        return (
+            f"{where}: {len(active)} versions are ACTIVE {active}; exactly one "
+            "version may be ACTIVE at any time"
+        )
+    if current_version is not None and current_version not in labels:
+        return (
+            f"{where}: current version '{current_version}' is not among the "
+            f"ring versions {sorted(labels)}"
+        )
+    if current_version is not None and active[0] != current_version:
+        return (
+            f"{where}: current version '{current_version}' is not the unique "
+            f"ACTIVE version '{active[0]}'; the current pointer must point at "
+            "the unique ACTIVE version"
+        )
+    return None
 
 
 class KeyStateStore(ABC):
@@ -177,12 +242,12 @@ class FileStateStore(KeyStateStore):
             raise ConfigurationError(
                 f"{where}: current_version '{current}' is not among the versions"
             )
-        current_state = next(v.state for v in versions if v.version == current)
-        if current_state is not KeyState.ACTIVE:
-            raise ConfigurationError(
-                f"{where}: current version '{current}' is {current_state.value}; "
-                "a snapshot's current version must be ACTIVE"
-            )
+        # Semantic ring invariants (exactly one ACTIVE version; the current
+        # pointer being that unique ACTIVE version) are NOT enforced here:
+        # a structurally parsable snapshot that violates them represents an
+        # inconsistent *persisted state* and is rejected by the manager with
+        # PERSISTED_STATE_INVALID at startup, using the exact same rule as the
+        # first-boot key-source validation.
         return RingSnapshot(
             key_id=key_id, current_version=current, versions=tuple(versions)
         )

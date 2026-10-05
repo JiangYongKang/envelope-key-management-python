@@ -36,6 +36,7 @@ from .errors import (
     KeyRevokedError,
     KeyVersionNotFoundError,
     NoActiveKeyError,
+    PersistedStateInvalidError,
     RotationRaceError,
 )
 from .key_source import LocalKeySource, generate_local_key
@@ -56,6 +57,7 @@ from .state_store import (
     KeyStateStore,
     RingSnapshot,
     VersionSnapshot,
+    validate_ring_invariant,
 )
 
 logger = logging.getLogger("ekm")
@@ -106,6 +108,14 @@ class KeyManager:
         on the very first boot (no snapshot yet), and the resulting ring is
         immediately persisted so later restarts never fall back to stale
         source configuration.
+
+        Both paths pass through the same ring-invariant check
+        (``validate_ring_invariant``): exactly one ACTIVE version must exist
+        and (for snapshots) the current pointer must target it. An
+        inconsistent *persisted* snapshot aborts startup with
+        :class:`PersistedStateInvalidError` — never silently loaded, repaired,
+        or masked by the source — while a bad first-boot source raises
+        :class:`ConfigurationError`.
         """
         snapshot = self._store.load()
         if snapshot is not None:
@@ -114,6 +124,24 @@ class KeyManager:
                     f"state store snapshot belongs to key id '{snapshot.key_id}' "
                     f"but this service is configured for '{self._key_id}'"
                 )
+            # The snapshot is authoritative for this key ring, so it must obey
+            # the same ring invariants as first boot: exactly one ACTIVE
+            # version, and the current pointer must target it. A violated
+            # snapshot means the *persisted state itself* is contradictory
+            # (e.g. hand-edited/restored wrong): refuse to start with a
+            # distinct, actionable reason. We neither silently load such a
+            # ring nor "repair" it nor fall back to the key source.
+            invalid_reason = validate_ring_invariant(
+                snapshot.current_version,
+                ((v.version, v.state) for v in snapshot.versions),
+                where=f"persisted state snapshot for key id '{self._key_id}'",
+            )
+            if invalid_reason is not None:
+                logger.error(
+                    "refusing to start: inconsistent persisted state key_id=%s: %s",
+                    self._key_id, invalid_reason,
+                )
+                raise PersistedStateInvalidError(invalid_reason)
             self._ring = {
                 v.version: KeyVersion(
                     version=v.version,
@@ -144,18 +172,21 @@ class KeyManager:
                 created_at=_utc_now(),
             )
 
-        active_versions = [s.version for s in sourced if s.state is KeyState.ACTIVE]
-        if not active_versions:
+        # First-boot sources carry no current pointer, but the ring invariant
+        # is identical to the one enforced for persisted snapshots: exactly one
+        # ACTIVE version exists; it becomes the current version.
+        invalid_reason = validate_ring_invariant(
+            None,
+            ((s.version, s.state) for s in sourced),
+            where="local key source",
+        )
+        if invalid_reason is not None:
             raise ConfigurationError(
-                "local key source provides no ACTIVE key version; "
-                "refusing to start without an encrypt-capable key"
-            )
-        if len(active_versions) > 1:
-            raise ConfigurationError(
-                "local key source declares multiple ACTIVE versions "
-                f"{active_versions}; exactly one current version is required"
+                f"{invalid_reason}; refusing to start without a unique "
+                "current ACTIVE key"
             )
 
+        active_versions = [s.version for s in sourced if s.state is KeyState.ACTIVE]
         self._ring = ring
         self._current_version = active_versions[0]
         # Sequence starts above any trailing integer suffix so generated
